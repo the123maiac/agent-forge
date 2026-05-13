@@ -3,6 +3,11 @@ import { initialState, save as saveState, defaultAgent } from './storage.js';
 import { buildMarkov, generateMarkov, applyVoice } from './markov.js';
 import { retrieveChunks, retrieveScored, extractAnswer } from './retrieval.js';
 import { nvidiaChat, firecrawlScrape, firecrawlCrawl } from './api.js';
+import {
+  buildVocab, buildModel, trainModel, sample,
+  saveModel, loadModel, deleteModel,
+  vocabToJSON, vocabFromJSON
+} from './neural.js';
 
 /* ---------- State ---------- */
 let state = initialState();
@@ -31,6 +36,19 @@ const scrapeUrl = $('scrapeUrl'), scrapeBtn = $('scrapeBtn');
 const playShell = $('playShell'), playInput = $('playInput'), playSend = $('playSend'), playCrumbs = $('playCrumbs');
 const toolGrid = $('toolGrid');
 const toastEl = $('toast');
+
+const neuralPanel = $('neuralPanel');
+const epSlider = $('epSlider'), epVal = $('epVal');
+const huSlider = $('huSlider'), huVal = $('huVal');
+const slSlider = $('slSlider'), slVal = $('slVal');
+const trainBtn = $('trainBtn'), resetNeuralBtn = $('resetNeuralBtn');
+const neuralStatus = $('neuralStatus');
+const neuralProgress = $('neuralProgress');
+const neuralConsole = $('neuralConsole');
+
+/* Loaded neural models, keyed by agent id.
+   Kept out of `state` because they hold tf.LayersModel objects. */
+const neuralCache = new Map(); // agentId -> { model, vocab }
 
 /* ---------- Toast ---------- */
 let toastT = null;
@@ -137,6 +155,7 @@ function renderTrainStatus() {
   const a = active();
   const dot = trainStatus.querySelector('.status-dot');
   dot.className = 'status-dot';
+  neuralPanel.hidden = a.mode !== 'neural';
   if (a.mode === 'nvidia') {
     if (state.keys.nvidia) { dot.classList.add('is-ready'); trainStatusText.textContent = `ready · NVIDIA ${a.model}`; }
     else { dot.classList.add('is-warn'); trainStatusText.textContent = 'NVIDIA key required'; }
@@ -144,9 +163,32 @@ function renderTrainStatus() {
     if (!state.keys.nvidia) { dot.classList.add('is-warn'); trainStatusText.textContent = 'add NVIDIA key, then synthesize in Knowledge'; }
     else if (a.chunks.length === 0) { trainStatusText.textContent = 'add seed chunks, then synthesize'; }
     else { dot.classList.add('is-ready'); trainStatusText.textContent = `teacher ready · ${a.chunks.length} chunks · synthesize in Knowledge`; }
+  } else if (a.mode === 'neural') {
+    if (a.chunks.length === 0) { trainStatusText.textContent = 'add training data, then click train'; }
+    else if (a.neural?.trained) { dot.classList.add('is-ready'); trainStatusText.textContent = `neural net trained · final loss ${(+a.neural.finalLoss).toFixed(3)} · ${a.neural.params} params`; }
+    else { dot.classList.add('is-warn'); trainStatusText.textContent = `${a.chunks.length} chunks ready · click train`; }
+    renderNeuralPanel();
   } else {
     if (a.chunks.length === 0) { trainStatusText.textContent = 'awaiting training data'; }
     else { dot.classList.add('is-ready'); trainStatusText.textContent = `trained · ${a.chunks.length} chunks · ${a.ngram}-gram`; }
+  }
+}
+
+function renderNeuralPanel() {
+  const a = active();
+  const cfg = a.neural || {};
+  epSlider.value = cfg.epochs || 20; epVal.textContent = epSlider.value; paintTrack(epSlider);
+  huSlider.value = cfg.lstmUnits || 96; huVal.textContent = huSlider.value; paintTrack(huSlider);
+  slSlider.value = cfg.seqLen || 60; slVal.textContent = slSlider.value; paintTrack(slSlider);
+  neuralStatus.className = 'neural-status';
+  if (a.neural?.trained) {
+    neuralStatus.classList.add('is-ready');
+    neuralStatus.textContent = `trained · loss ${(+a.neural.finalLoss).toFixed(3)} · vocab ${a.neural.vocabSize}`;
+  } else if (a.chunks.length === 0) {
+    neuralStatus.classList.add('is-warn');
+    neuralStatus.textContent = 'load knowledge first';
+  } else {
+    neuralStatus.textContent = 'no model · click train';
   }
 }
 
@@ -207,6 +249,11 @@ function renderPlayground() {
   if (a.mode === 'nvidia') {
     playCrumbs.textContent = state.keys.nvidia ? `NVIDIA RAG · ${a.model}` : 'NVIDIA key required';
     playInput.placeholder = state.keys.nvidia ? `ask ${a.name}…` : `add a NVIDIA key first…`;
+  } else if (a.mode === 'neural') {
+    playCrumbs.textContent = a.neural?.trained
+      ? `neural net · ${a.neural.params} params · loss ${(+a.neural.finalLoss).toFixed(3)}`
+      : 'neural net · not trained · click train';
+    playInput.placeholder = a.neural?.trained ? `prompt ${a.name}…` : 'train the neural net first…';
   } else {
     const tag = a.mode === 'taught' ? 'taught n-gram' : 'n-gram';
     playCrumbs.textContent = a.chunks.length ? `${tag} · ${a.ngram}-gram · ${a.chunks.length} chunks` : 'not trained · add knowledge to begin';
@@ -220,7 +267,9 @@ function renderPlayground() {
     const s = document.createElement('div'); s.className = 's';
     s.textContent = a.mode === 'nvidia'
       ? (state.keys.nvidia ? 'powered by NVIDIA build · grounded in your chunks' : 'no key yet — paste your nvapi key first')
-      : (a.chunks.length ? (a.mode === 'taught' ? 'trained locally from synthesized data' : 'trained locally — runs in your browser') : 'no model yet — train me first');
+      : a.mode === 'neural'
+        ? (a.neural?.trained ? 'real neural net · sampling char by char' : 'train the neural net first')
+        : (a.chunks.length ? (a.mode === 'taught' ? 'trained locally from synthesized data' : 'trained locally — runs in your browser') : 'no model yet — train me first');
     empty.append(g, t, s);
     playShell.append(empty);
   }
@@ -405,6 +454,106 @@ async function ingestFiles(files) {
   if (total) toast(`ingested ${total} chunks from ${files.length} file${files.length > 1 ? 's' : ''}`);
 }
 
+/* ---------- Neural training ---------- */
+epSlider.addEventListener('input', () => { epVal.textContent = epSlider.value; paintTrack(epSlider); });
+huSlider.addEventListener('input', () => { huVal.textContent = huSlider.value; paintTrack(huSlider); });
+slSlider.addEventListener('input', () => { slVal.textContent = slSlider.value; paintTrack(slSlider); });
+
+function corpusFor(a) {
+  return a.chunks.map(c => `${c.title}\n${c.text}`).join('\n\n').slice(0, 60000);
+}
+
+function logEpoch(epoch, total, loss) {
+  neuralConsole.hidden = false;
+  const line = document.createElement('div');
+  const ep = document.createElement('span'); ep.className = 'epoch'; ep.textContent = `epoch ${String(epoch).padStart(2, ' ')}/${total} · `;
+  const ls = document.createElement('span'); ls.className = 'loss'; ls.textContent = `loss ${loss.toFixed(4)}`;
+  line.append(ep, ls);
+  neuralConsole.appendChild(line);
+  neuralConsole.scrollTop = neuralConsole.scrollHeight;
+}
+
+async function ensureNeural(a) {
+  if (neuralCache.has(a.id)) return neuralCache.get(a.id);
+  if (!a.neural?.trained) return null;
+  const model = await loadModel(a.id);
+  const vocab = vocabFromJSON(a.neural.vocabJSON);
+  if (!model || !vocab) return null;
+  const entry = { model, vocab };
+  neuralCache.set(a.id, entry);
+  return entry;
+}
+
+trainBtn.addEventListener('click', async () => {
+  const a = active();
+  if (a.chunks.length === 0) { toast('add chunks first', true); return; }
+  if (!window.tf) { toast('TensorFlow.js not loaded — check your connection', true); return; }
+  const epochs = +epSlider.value, lstmUnits = +huSlider.value, seqLen = +slSlider.value;
+  trainBtn.disabled = true;
+  resetNeuralBtn.disabled = true;
+  trainBtn.textContent = 'training…';
+  neuralProgress.classList.add('is-running');
+  neuralConsole.replaceChildren();
+  neuralConsole.hidden = false;
+
+  try {
+    const text = corpusFor(a);
+    const vocab = buildVocab(text);
+    if (vocab.vocabSize > 200) {
+      // Very rare on natural text — char-level is bounded
+      toast(`large vocab (${vocab.vocabSize}) — training will be slow`);
+    }
+    const model = buildModel({ vocabSize: vocab.vocabSize, embedDim: 24, lstmUnits });
+    const params = model.countParams();
+    neuralProgress.textContent = `compiled · ${params} params · ${text.length} chars · ${vocab.vocabSize} symbols`;
+
+    let finalLoss = NaN;
+    await trainModel(model, text, vocab, { epochs, seqLen, batchSize: 32, stride: 3 }, async (epoch, loss) => {
+      finalLoss = loss;
+      logEpoch(epoch, epochs, loss);
+      neuralProgress.textContent = `epoch ${epoch}/${epochs} · loss ${loss.toFixed(3)}`;
+    });
+
+    await saveModel(model, a.id);
+    neuralCache.set(a.id, { model, vocab });
+    a.neural = {
+      trained: true,
+      epochs, lstmUnits, seqLen,
+      vocabSize: vocab.vocabSize,
+      params,
+      finalLoss,
+      vocabJSON: vocabToJSON(vocab),
+      trainedAt: Date.now()
+    };
+    save(); renderAll();
+    neuralProgress.textContent = `done · loss ${finalLoss.toFixed(3)}`;
+    toast(`neural net trained · loss ${finalLoss.toFixed(3)}`);
+  } catch (err) {
+    console.error(err);
+    toast(err.message || 'training failed', true);
+    neuralProgress.textContent = 'failed';
+  } finally {
+    trainBtn.disabled = false;
+    resetNeuralBtn.disabled = false;
+    trainBtn.textContent = '▶ train neural net';
+    neuralProgress.classList.remove('is-running');
+  }
+});
+
+resetNeuralBtn.addEventListener('click', async () => {
+  const a = active();
+  if (!a.neural?.trained && !neuralCache.has(a.id)) { toast('no model to reset'); return; }
+  if (!confirm('Delete this agent\'s trained neural model?')) return;
+  await deleteModel(a.id);
+  neuralCache.delete(a.id);
+  a.neural = null;
+  save(); renderAll();
+  neuralConsole.replaceChildren();
+  neuralConsole.hidden = true;
+  neuralProgress.textContent = '';
+  toast('model deleted');
+});
+
 /* ---------- Synthesize (NVIDIA teacher → permanent corpus) ---------- */
 let synthCount = 10, synthStrategy = 'expand';
 $('synthCount').addEventListener('click', e => {
@@ -563,6 +712,13 @@ async function generate(msg) {
       temperature: a.temperature
     });
     return applyVoice(out, a.voice);
+  } else if (a.mode === 'neural') {
+    const entry = await ensureNeural(a);
+    if (!entry) throw new Error('no trained model — click train in the Training tab');
+    const length = Math.min(220, Math.max(60, a.maxTokens * 3));
+    const seed = msg.slice(-80);
+    const raw = await sample(entry.model, seed, length, a.temperature, entry.vocab);
+    return applyVoice(raw.trim(), a.voice);
   } else {
     if (!a.chunks.length) throw new Error('no training data — add chunks first');
 

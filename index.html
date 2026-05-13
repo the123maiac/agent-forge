@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
 </head>
 <body>
   <div class="app">
@@ -124,20 +125,54 @@
           <div class="row full">
             <div>
               <div class="label">Training mode <span class="hint">how the agent answers</span></div>
-              <div class="mode-cards" id="modeCards">
+              <div class="mode-cards mode-cards-4" id="modeCards">
                 <button class="mode-card" data-mode="scratch">
-                  <span class="nm">From scratch</span>
-                  <span class="meta">local n-gram only · learns purely from your chunks · runs forever, no key</span>
+                  <span class="nm">N-gram (instant)</span>
+                  <span class="meta">word-level Markov · retrieval-first · zero training, runs immediately</span>
+                </button>
+                <button class="mode-card" data-mode="neural">
+                  <span class="nm">Neural net (from scratch)</span>
+                  <span class="meta">real char-level RNN · trains in your browser via backprop · no LLM, no key</span>
                 </button>
                 <button class="mode-card" data-mode="taught">
                   <span class="nm">Base-model taught</span>
-                  <span class="meta">NVIDIA generates training data from your seeds · local n-gram learns it · permanent</span>
+                  <span class="meta">NVIDIA generates training data from your seeds · local model learns it · permanent</span>
                 </button>
                 <button class="mode-card" data-mode="nvidia">
                   <span class="nm">Base model (RAG)</span>
                   <span class="meta">NVIDIA answers directly · retrieves your chunks per question · needs an active key</span>
                 </button>
               </div>
+            </div>
+          </div>
+
+          <div class="row full" id="neuralPanel" hidden>
+            <div>
+              <div class="label">Neural training <span class="hint">char-level RNN · trained locally with TensorFlow.js</span></div>
+              <div class="neural-grid">
+                <div class="neural-cell">
+                  <div class="micro">Epochs · <span id="epVal">20</span></div>
+                  <input type="range" min="5" max="60" step="1" value="20" class="slider" id="epSlider" />
+                </div>
+                <div class="neural-cell">
+                  <div class="micro">Hidden units · <span id="huVal">96</span></div>
+                  <input type="range" min="32" max="192" step="16" value="96" class="slider" id="huSlider" />
+                </div>
+                <div class="neural-cell">
+                  <div class="micro">Sequence length · <span id="slVal">60</span></div>
+                  <input type="range" min="20" max="120" step="10" value="60" class="slider" id="slSlider" />
+                </div>
+                <div class="neural-cell">
+                  <div class="micro">Status</div>
+                  <div class="neural-status" id="neuralStatus">no model · click train</div>
+                </div>
+              </div>
+              <div class="neural-actions">
+                <button class="btn-train" id="trainBtn">▶ train neural net</button>
+                <button class="btn-train alt" id="resetNeuralBtn">reset model</button>
+                <span class="neural-progress" id="neuralProgress"></span>
+              </div>
+              <div class="neural-console" id="neuralConsole" hidden></div>
             </div>
           </div>
 
