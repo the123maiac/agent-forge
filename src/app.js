@@ -1,7 +1,7 @@
 import { DATASETS } from './datasets.js';
 import { initialState, save as saveState, defaultAgent } from './storage.js';
 import { buildMarkov, generateMarkov, applyVoice } from './markov.js';
-import { retrieveChunks } from './retrieval.js';
+import { retrieveChunks, retrieveScored, extractAnswer } from './retrieval.js';
 import { nvidiaChat, firecrawlScrape, firecrawlCrawl } from './api.js';
 
 /* ---------- State ---------- */
@@ -565,8 +565,31 @@ async function generate(msg) {
     return applyVoice(out, a.voice);
   } else {
     if (!a.chunks.length) throw new Error('no training data — add chunks first');
-    const model = buildMarkov(a.chunks, a.ngram);
-    const raw = generateMarkov(model, msg, a.maxTokens, a.temperature);
+
+    // 1. Retrieval first: if the user's message strongly matches a chunk, surface it directly.
+    const scored = retrieveScored(a.chunks, msg, 5);
+    if (scored.length) {
+      const top = scored[0];
+      const answer = extractAnswer(top.chunk.text);
+      // Q&A chunk with a decent match → return the A: body verbatim.
+      if (answer && top.score >= 0.4) {
+        return applyVoice(answer, a.voice);
+      }
+      // Plain chunk with a very strong match → return it as the response.
+      if (!answer && top.score >= 1.2) {
+        return applyVoice(top.chunk.text.trim(), a.voice);
+      }
+    }
+
+    // 2. Focused Markov: train on the retrieved subset for relevance, fall back to the full corpus.
+    const focus = scored.filter(x => x.score > 0).map(x => x.chunk);
+    const useChunks = focus.length >= 2 ? focus : a.chunks;
+    let model = buildMarkov(useChunks, a.ngram);
+    let raw = generateMarkov(model, msg, a.maxTokens, a.temperature);
+    if (!raw && useChunks !== a.chunks) {
+      model = buildMarkov(a.chunks, a.ngram);
+      raw = generateMarkov(model, msg, a.maxTokens, a.temperature);
+    }
     if (!raw) throw new Error('not enough data — add more chunks or lower the n-gram order');
     return applyVoice(raw, a.voice);
   }
