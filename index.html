@@ -257,10 +257,29 @@
           </div>
 
           <div class="dropzone" id="drop">
-            <input type="file" id="fileInput" multiple accept=".txt,.md,.json,.html" style="display:none" />
+            <input type="file" id="fileInput" multiple accept=".txt,.md,.json,.html,.csv,.log,.xml,.yaml,.yml,.py,.js,.ts" style="display:none" />
+            <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none" />
             <span class="icon">⇧</span>
-            <div class="t">drop training data · .txt .md .json</div>
-            <div class="s">chunks into ~1k char segments</div>
+            <div class="t">drop files or a folder · streams in chunks</div>
+            <div class="s">.txt .md .json .csv .log etc · stored in IndexedDB · GB-scale capable</div>
+            <div class="drop-actions">
+              <button class="drop-btn" id="pickFiles">choose files</button>
+              <button class="drop-btn" id="pickFolder">choose folder</button>
+            </div>
+          </div>
+
+          <div class="ingest-bar" id="ingestBar" hidden>
+            <div class="ingest-info" id="ingestInfo">starting…</div>
+            <div class="ingest-track"><div class="ingest-fill" id="ingestFill"></div></div>
+            <button class="ingest-cancel" id="ingestCancel">cancel</button>
+          </div>
+
+          <div class="quota">
+            <div class="quota-row">
+              <span class="quota-label">browser storage</span>
+              <span class="quota-value" id="quotaLabel">measuring…</span>
+            </div>
+            <div class="quota-track"><div class="quota-fill" id="quotaBar"></div></div>
           </div>
 
           <div class="add-row">

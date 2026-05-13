@@ -155,6 +155,26 @@ main { overflow-y: auto; position: relative; }
 .dropzone .t { font-family: var(--font-display); font-size: 15px; }
 .dropzone .s { color: var(--ink-3); font-size: 11px; margin-top: 4px; letter-spacing: 0.04em; }
 
+.drop-actions { display: flex; gap: 10px; justify-content: center; margin-top: 14px; }
+.drop-btn { padding: 8px 16px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg-2); color: var(--ink-2); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; transition: all .12s ease; }
+.drop-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+.ingest-bar { margin-top: 14px; padding: 12px 14px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 4px; display: grid; grid-template-columns: 1fr 80px; gap: 10px; align-items: center; }
+.ingest-info { grid-column: 1 / -1; color: var(--ink-2); font-size: 11px; }
+.ingest-track { grid-column: 1; height: 6px; background: oklch(0.22 0.012 250); border-radius: 999px; overflow: hidden; }
+.ingest-fill { height: 100%; width: 0; background: var(--accent); box-shadow: 0 0 12px var(--accent-glow); transition: width .15s ease; }
+.ingest-cancel { grid-column: 2; padding: 6px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg-2); color: var(--ink-3); font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; }
+.ingest-cancel:hover { color: var(--danger); border-color: var(--danger); }
+
+.quota { margin-top: 14px; padding: 10px 14px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 4px; }
+.quota-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.quota-label { color: var(--ink-3); font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; }
+.quota-value { color: var(--ink-2); font-size: 11px; }
+.quota-track { height: 4px; background: oklch(0.22 0.012 250); border-radius: 999px; overflow: hidden; }
+.quota-fill { height: 100%; width: var(--p, 0%); background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); transition: width .25s ease; }
+
+.chunks-note { color: var(--ink-3); font-size: 11px; padding: 8px 12px; font-style: italic; }
+
 .add-row { display: grid; grid-template-columns: 220px 1fr 90px; gap: 12px; margin-top: 18px; }
 .add-row input, .add-row textarea { background: var(--bg-2); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; }
 .add-row textarea { min-height: 60px; }

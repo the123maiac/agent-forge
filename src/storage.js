@@ -21,7 +21,9 @@ export function defaultAgent(name = 'Atlas') {
     maxTokens: 80,
     mode: 'scratch',
     model: 'meta/llama-3.1-8b-instruct',
-    chunks: [],
+    // Counts are cached for cheap UI rendering; the actual chunks live in IDB.
+    chunkCount: 0,
+    chunkChars: 0,
     datasets: [],
     tools: { firecrawl: false, gworkspace: false, vector: false }
   };
@@ -45,8 +47,41 @@ export function migrate(s) {
   for (const a of s.agents) {
     if (!a.mode) a.mode = a.engine === 'nvidia' ? 'nvidia' : 'scratch';
     if (!Array.isArray(a.datasets)) a.datasets = [];
+    if (a.chunkCount == null) a.chunkCount = Array.isArray(a.chunks) ? a.chunks.length : 0;
+    if (a.chunkChars == null) {
+      a.chunkChars = Array.isArray(a.chunks)
+        ? a.chunks.reduce((n, c) => n + (c.text || '').length, 0)
+        : 0;
+    }
   }
   return s;
+}
+
+/* If the loaded state still has a `chunks` array on any agent, move them
+   into IndexedDB and strip them from the in-memory state. Returns the
+   number of agents that needed migration. */
+export async function moveLegacyChunksToDB(s, addBatch) {
+  let migrated = 0;
+  for (const a of s.agents || []) {
+    if (Array.isArray(a.chunks) && a.chunks.length) {
+      const rows = a.chunks.map(c => ({
+        id: c.id || crypto.randomUUID(),
+        agentId: a.id,
+        title: c.title || 'untitled',
+        text: c.text || '',
+        source: c.source || 'legacy',
+        ts: c.ts || Date.now()
+      }));
+      await addBatch(rows);
+      a.chunkCount = rows.length;
+      a.chunkChars = rows.reduce((n, r) => n + r.text.length, 0);
+      delete a.chunks;
+      migrated++;
+    } else {
+      delete a.chunks;
+    }
+  }
+  return migrated;
 }
 
 export function initialState() {

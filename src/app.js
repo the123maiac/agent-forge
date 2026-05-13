@@ -1,5 +1,6 @@
 import { DATASETS } from './datasets.js';
-import { initialState, save as saveState, defaultAgent } from './storage.js';
+import { initialState, save as saveState, defaultAgent, moveLegacyChunksToDB } from './storage.js';
+import * as db from './db.js';
 import { buildMarkov, generateMarkov, applyVoice } from './markov.js';
 import { retrieveChunks, retrieveScored, extractAnswer } from './retrieval.js';
 import { nvidiaChat, firecrawlScrape, firecrawlCrawl } from './api.js';
@@ -14,6 +15,24 @@ let state = initialState();
 const save = () => saveState(state);
 save();
 const active = () => state.agents.find(a => a.id === state.activeId) || state.agents[0];
+
+/* Chunks cache (active agent kept hot, others fetched on demand). */
+const chunkCache = new Map(); // agentId -> chunks[]
+async function getChunks(agentId) {
+  if (chunkCache.has(agentId)) return chunkCache.get(agentId);
+  const rows = await db.getAllForAgent(agentId);
+  chunkCache.set(agentId, rows);
+  return rows;
+}
+function invalidateChunks(agentId) { chunkCache.delete(agentId); }
+async function refreshCounts(agentId) {
+  const rows = await getChunks(agentId);
+  const a = state.agents.find(x => x.id === agentId);
+  if (!a) return;
+  a.chunkCount = rows.length;
+  a.chunkChars = rows.reduce((n, r) => n + (r.text || '').length, 0);
+  save();
+}
 
 /* ---------- DOM refs ---------- */
 const $ = (id) => document.getElementById(id);
@@ -31,7 +50,9 @@ const agentList = $('agentList'), agentCount = $('agentCount');
 const newAgent = $('newAgent');
 const chunksEl = $('chunks'), kChunks = $('kChunks'), kChars = $('kChars');
 const chunkTitle = $('chunkTitle'), chunkText = $('chunkText');
-const fileInput = $('fileInput'), dropEl = $('drop');
+const fileInput = $('fileInput'), folderInput = $('folderInput'), dropEl = $('drop');
+const ingestBar = $('ingestBar'), ingestInfo = $('ingestInfo'), ingestFill = $('ingestFill'), ingestCancel = $('ingestCancel');
+let ingestAbort = false;
 const scrapeUrl = $('scrapeUrl'), scrapeBtn = $('scrapeBtn');
 const playShell = $('playShell'), playInput = $('playInput'), playSend = $('playSend'), playCrumbs = $('playCrumbs');
 const toolGrid = $('toolGrid');
@@ -80,20 +101,22 @@ function renderSidebar() {
     const close = document.createElement('span'); close.className = 'close'; close.textContent = '×'; close.title = 'remove';
     row.append(nameWrap, close);
     const meta = document.createElement('span'); meta.className = 'agent-meta';
-    meta.textContent = `${a.chunks.length} chunks · ${a.ngram}-gram`;
+    meta.textContent = `${a.chunkCount.toLocaleString()} chunks · ${a.ngram}-gram`;
     btn.append(row, meta);
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       if (e.target === close) {
         e.stopPropagation();
         if (state.agents.length <= 1) { toast('Need at least one agent.', true); return; }
         if (!confirm(`Delete agent "${a.name}"?`)) return;
+        await db.deleteAllForAgent(a.id);
+        invalidateChunks(a.id);
         state.agents = state.agents.filter(x => x.id !== a.id);
         if (state.activeId === a.id) state.activeId = state.agents[0].id;
-        save(); renderAll();
+        save(); await renderAll();
         return;
       }
       state.activeId = a.id;
-      save(); renderAll();
+      save(); await renderAll();
     });
     agentList.append(btn);
   }
@@ -161,16 +184,16 @@ function renderTrainStatus() {
     else { dot.classList.add('is-warn'); trainStatusText.textContent = 'NVIDIA key required'; }
   } else if (a.mode === 'taught') {
     if (!state.keys.nvidia) { dot.classList.add('is-warn'); trainStatusText.textContent = 'add NVIDIA key, then synthesize in Knowledge'; }
-    else if (a.chunks.length === 0) { trainStatusText.textContent = 'add seed chunks, then synthesize'; }
-    else { dot.classList.add('is-ready'); trainStatusText.textContent = `teacher ready · ${a.chunks.length} chunks · synthesize in Knowledge`; }
+    else if (a.chunkCount === 0) { trainStatusText.textContent = 'add seed chunks, then synthesize'; }
+    else { dot.classList.add('is-ready'); trainStatusText.textContent = `teacher ready · ${a.chunkCount} chunks · synthesize in Knowledge`; }
   } else if (a.mode === 'neural') {
-    if (a.chunks.length === 0) { trainStatusText.textContent = 'add training data, then click train'; }
+    if (a.chunkCount === 0) { trainStatusText.textContent = 'add training data, then click train'; }
     else if (a.neural?.trained) { dot.classList.add('is-ready'); trainStatusText.textContent = `neural net trained · final loss ${(+a.neural.finalLoss).toFixed(3)} · ${a.neural.params} params`; }
-    else { dot.classList.add('is-warn'); trainStatusText.textContent = `${a.chunks.length} chunks ready · click train`; }
+    else { dot.classList.add('is-warn'); trainStatusText.textContent = `${a.chunkCount} chunks ready · click train`; }
     renderNeuralPanel();
   } else {
-    if (a.chunks.length === 0) { trainStatusText.textContent = 'awaiting training data'; }
-    else { dot.classList.add('is-ready'); trainStatusText.textContent = `trained · ${a.chunks.length} chunks · ${a.ngram}-gram`; }
+    if (a.chunkCount === 0) { trainStatusText.textContent = 'awaiting training data'; }
+    else { dot.classList.add('is-ready'); trainStatusText.textContent = `trained · ${a.chunkCount} chunks · ${a.ngram}-gram`; }
   }
 }
 
@@ -184,7 +207,7 @@ function renderNeuralPanel() {
   if (a.neural?.trained) {
     neuralStatus.classList.add('is-ready');
     neuralStatus.textContent = `trained · loss ${(+a.neural.finalLoss).toFixed(3)} · vocab ${a.neural.vocabSize}`;
-  } else if (a.chunks.length === 0) {
+  } else if (a.chunkCount === 0) {
     neuralStatus.classList.add('is-warn');
     neuralStatus.textContent = 'load knowledge first';
   } else {
@@ -192,12 +215,20 @@ function renderNeuralPanel() {
   }
 }
 
-function renderKnowledge() {
+async function renderKnowledge() {
   const a = active();
   chunksEl.replaceChildren();
-  let chars = 0;
-  for (const c of a.chunks) {
-    chars += (c.text || '').length;
+  // Don't render every chunk if we have thousands — just the most recent 200.
+  // The full set still trains models; this is just the display list.
+  const all = await getChunks(a.id);
+  const visible = all.slice(-200).reverse();
+  if (all.length > visible.length) {
+    const note = document.createElement('div');
+    note.className = 'chunks-note';
+    note.textContent = `showing ${visible.length} of ${all.length.toLocaleString()} chunks (most recent first)`;
+    chunksEl.append(note);
+  }
+  for (const c of visible) {
     const el = document.createElement('div'); el.className = 'chunk';
     const left = document.createElement('div');
     const t = document.createElement('div'); t.className = 'ct'; t.textContent = c.title || 'untitled';
@@ -206,19 +237,40 @@ function renderKnowledge() {
     meta.textContent = `${(c.text || '').length} chars · ${c.source || 'manual'}`;
     left.append(t, b, meta);
     const del = document.createElement('span'); del.className = 'del'; del.textContent = '×';
-    del.addEventListener('click', () => {
-      a.chunks = a.chunks.filter(x => x.id !== c.id);
-      save(); renderAll();
+    del.addEventListener('click', async () => {
+      await db.deleteOne(c.id);
+      invalidateChunks(a.id);
+      await refreshCounts(a.id);
+      await renderAll();
     });
     el.append(left, del);
     chunksEl.append(el);
   }
-  kChunks.textContent = a.chunks.length;
-  kChars.textContent = chars;
+  kChunks.textContent = a.chunkCount.toLocaleString();
+  kChars.textContent = a.chunkChars.toLocaleString();
+  await renderQuota();
 
   const fcOn = !!state.keys.firecrawl;
   scrapeBtn.disabled = !fcOn;
   scrapeBtn.title = fcOn ? 'scrape via Firecrawl' : 'add a Firecrawl key in Training';
+}
+
+async function renderQuota() {
+  const q = await db.quota();
+  const el = document.getElementById('quotaBar');
+  if (!el || !q.quota) return;
+  const pct = q.usage / q.quota;
+  el.style.setProperty('--p', (pct * 100).toFixed(1) + '%');
+  const label = document.getElementById('quotaLabel');
+  if (label) label.textContent = `${fmtBytes(q.usage)} of ~${fmtBytes(q.quota)} (${(pct * 100).toFixed(1)}%)`;
+}
+
+function fmtBytes(n) {
+  if (n == null) return '?';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n >= 100 ? 0 : 1)} ${u[i]}`;
 }
 
 function renderTools() {
@@ -256,8 +308,8 @@ function renderPlayground() {
     playInput.placeholder = a.neural?.trained ? `prompt ${a.name}…` : 'train the neural net first…';
   } else {
     const tag = a.mode === 'taught' ? 'taught n-gram' : 'n-gram';
-    playCrumbs.textContent = a.chunks.length ? `${tag} · ${a.ngram}-gram · ${a.chunks.length} chunks` : 'not trained · add knowledge to begin';
-    playInput.placeholder = a.chunks.length ? `say something to ${a.name}…` : `train ${a.name} first…`;
+    playCrumbs.textContent = a.chunkCount ? `${tag} · ${a.ngram}-gram · ${a.chunkCount} chunks` : 'not trained · add knowledge to begin';
+    playInput.placeholder = a.chunkCount ? `say something to ${a.name}…` : `train ${a.name} first…`;
   }
   if (!playShell.dataset.hasMessages) {
     playShell.replaceChildren();
@@ -269,18 +321,18 @@ function renderPlayground() {
       ? (state.keys.nvidia ? 'powered by NVIDIA build · grounded in your chunks' : 'no key yet — paste your nvapi key first')
       : a.mode === 'neural'
         ? (a.neural?.trained ? 'real neural net · sampling char by char' : 'train the neural net first')
-        : (a.chunks.length ? (a.mode === 'taught' ? 'trained locally from synthesized data' : 'trained locally — runs in your browser') : 'no model yet — train me first');
+        : (a.chunkCount ? (a.mode === 'taught' ? 'trained locally from synthesized data' : 'trained locally — runs in your browser') : 'no model yet — train me first');
     empty.append(g, t, s);
     playShell.append(empty);
   }
 }
 
-function renderAll() {
+async function renderAll() {
   renderSidebar();
   renderHead();
   renderIdentity();
   renderTrainStatus();
-  renderKnowledge();
+  await renderKnowledge();
   renderDatasets();
   renderTools();
   renderKeys();
@@ -303,29 +355,30 @@ function chunkize(text, maxChars = 1000) {
   return out;
 }
 
-function addChunks(items, source = 'manual') {
+async function addChunks(items, source = 'manual') {
   const a = active();
-  for (const it of items) {
-    a.chunks.push({
-      id: crypto.randomUUID(),
-      title: it.title || 'untitled',
-      text: it.text,
-      source,
-      ts: Date.now()
-    });
-  }
-  save(); renderAll();
+  const rows = items.map(it => ({
+    id: crypto.randomUUID(),
+    agentId: a.id,
+    title: it.title || 'untitled',
+    text: it.text,
+    source,
+    ts: Date.now()
+  }));
+  await db.addChunksBatch(rows);
+  invalidateChunks(a.id);
+  await refreshCounts(a.id);
+  await renderAll();
 }
 
-function loadDataset(key) {
+async function loadDataset(key) {
   const ds = DATASETS[key];
   if (!ds) return;
   const a = active();
   if (a.datasets.includes(key)) { toast(`${ds.name} already loaded`); return; }
-  const items = ds.items.map(it => ({ title: `${ds.name} · ${it.title}`, text: it.text }));
-  addChunks(items, 'dataset:' + key);
   a.datasets.push(key);
-  save(); renderAll();
+  const items = ds.items.map(it => ({ title: `${ds.name} · ${it.title}`, text: it.text }));
+  await addChunks(items, 'dataset:' + key);
   toast(`+${items.length} chunks from ${ds.name}`);
 }
 
@@ -431,7 +484,6 @@ $('addChunk').addEventListener('click', () => {
   toast(`added ${parts.length} chunk${parts.length > 1 ? 's' : ''}`);
 });
 
-dropEl.addEventListener('click', () => fileInput.click());
 dropEl.addEventListener('dragover', e => { e.preventDefault(); dropEl.classList.add('is-drag'); });
 dropEl.addEventListener('dragleave', () => dropEl.classList.remove('is-drag'));
 dropEl.addEventListener('drop', async e => {
@@ -439,19 +491,70 @@ dropEl.addEventListener('drop', async e => {
   dropEl.classList.remove('is-drag');
   await ingestFiles([...(e.dataTransfer.files || [])]);
 });
+$('pickFiles').addEventListener('click', (e) => { e.stopPropagation(); fileInput.click(); });
+$('pickFolder').addEventListener('click', (e) => { e.stopPropagation(); folderInput.click(); });
 fileInput.addEventListener('change', async () => {
   await ingestFiles([...fileInput.files]);
   fileInput.value = '';
 });
+folderInput.addEventListener('change', async () => {
+  await ingestFiles([...folderInput.files]);
+  folderInput.value = '';
+});
+ingestCancel.addEventListener('click', () => { ingestAbort = true; });
+
+function showIngest(text) {
+  ingestBar.hidden = false;
+  ingestInfo.textContent = text;
+}
+function setIngestPct(p) { ingestFill.style.width = (p * 100).toFixed(1) + '%'; }
+function hideIngest() { ingestBar.hidden = true; setIngestPct(0); }
+
+const TEXT_LIKE = /\.(txt|md|markdown|json|csv|tsv|log|xml|html?|yaml|yml|py|js|jsx|ts|tsx|java|rs|c|cpp|h|hpp|go|rb|sh|sql|toml|ini|cfg|conf)$/i;
+
 async function ingestFiles(files) {
-  let total = 0;
-  for (const f of files) {
-    const text = await f.text();
-    const parts = chunkize(text);
-    addChunks(parts.map((t, i) => ({ title: parts.length > 1 ? `${f.name} #${i + 1}` : f.name, text: t })), 'file');
-    total += parts.length;
+  if (!files.length) return;
+  ingestAbort = false;
+  const a = active();
+  const eligible = files.filter(f => TEXT_LIKE.test(f.name) || f.type.startsWith('text/'));
+  if (!eligible.length) { toast('no text-like files found', true); return; }
+  const totalBytes = eligible.reduce((n, f) => n + f.size, 0);
+  let doneBytes = 0;
+  let totalChunks = 0;
+  showIngest(`preparing ${eligible.length.toLocaleString()} file${eligible.length > 1 ? 's' : ''} · ${fmtBytes(totalBytes)}…`);
+  const t0 = performance.now();
+  try {
+    for (let i = 0; i < eligible.length; i++) {
+      if (ingestAbort) { toast('ingest cancelled', true); break; }
+      const f = eligible[i];
+      let fileBytesAtStart = doneBytes;
+      const written = await db.ingestFile(f, a.id, {
+        chunkChars: 1000,
+        batchSize: 250,
+        onProgress: ({ bytes, name, chunksWritten }) => {
+          if (ingestAbort) throw new Error('cancelled');
+          const overall = fileBytesAtStart + bytes;
+          setIngestPct(Math.min(1, overall / totalBytes));
+          ingestInfo.textContent = `file ${i + 1}/${eligible.length} · ${name} · ${fmtBytes(overall)} of ${fmtBytes(totalBytes)} · ${(totalChunks + chunksWritten).toLocaleString()} chunks`;
+        }
+      });
+      totalChunks += written;
+      doneBytes += f.size;
+    }
+    invalidateChunks(a.id);
+    await refreshCounts(a.id);
+    await renderAll();
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    toast(`ingested ${totalChunks.toLocaleString()} chunks from ${eligible.length.toLocaleString()} files · ${secs}s`);
+  } catch (err) {
+    if (err.message !== 'cancelled') toast(err.message || 'ingest failed', true);
+    invalidateChunks(a.id);
+    await refreshCounts(a.id);
+    await renderAll();
+  } finally {
+    hideIngest();
+    ingestAbort = false;
   }
-  if (total) toast(`ingested ${total} chunks from ${files.length} file${files.length > 1 ? 's' : ''}`);
 }
 
 /* ---------- Neural training ---------- */
@@ -459,8 +562,9 @@ epSlider.addEventListener('input', () => { epVal.textContent = epSlider.value; p
 huSlider.addEventListener('input', () => { huVal.textContent = huSlider.value; paintTrack(huSlider); });
 slSlider.addEventListener('input', () => { slVal.textContent = slSlider.value; paintTrack(slSlider); });
 
-function corpusFor(a) {
-  return a.chunks.map(c => `${c.title}\n${c.text}`).join('\n\n').slice(0, 60000);
+async function corpusFor(a) {
+  const rows = await getChunks(a.id);
+  return rows.map(c => `${c.title}\n${c.text}`).join('\n\n').slice(0, 60000);
 }
 
 function logEpoch(epoch, total, loss) {
@@ -486,7 +590,7 @@ async function ensureNeural(a) {
 
 trainBtn.addEventListener('click', async () => {
   const a = active();
-  if (a.chunks.length === 0) { toast('add chunks first', true); return; }
+  if (a.chunkCount === 0) { toast('add chunks first', true); return; }
   if (!window.tf) { toast('TensorFlow.js not loaded — check your connection', true); return; }
   const epochs = +epSlider.value, lstmUnits = +huSlider.value, seqLen = +slSlider.value;
   trainBtn.disabled = true;
@@ -497,7 +601,7 @@ trainBtn.addEventListener('click', async () => {
   neuralConsole.hidden = false;
 
   try {
-    const text = corpusFor(a);
+    const text = await corpusFor(a);
     const vocab = buildVocab(text);
     if (vocab.vocabSize > 200) {
       // Very rare on natural text — char-level is bounded
@@ -577,12 +681,13 @@ const STRATEGY_INSTRUCTIONS = {
 $('synthBtn').addEventListener('click', async () => {
   const a = active();
   if (!state.keys.nvidia) { toast('add an NVIDIA key in Training first', true); return; }
-  if (!a.chunks.length) { toast('add at least one seed chunk first', true); return; }
+  if (!a.chunkCount) { toast('add at least one seed chunk first', true); return; }
   const btn = $('synthBtn');
   const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'synthesizing…';
   try {
-    const seedTxt = a.chunks.slice(0, 8).map(c => `[${c.title}]\n${c.text}`).join('\n\n---\n\n').slice(0, 8000);
+    const allChunks = await getChunks(a.id);
+    const seedTxt = allChunks.slice(0, 8).map(c => `[${c.title}]\n${c.text}`).join('\n\n---\n\n').slice(0, 8000);
     const steering = $('synthSeed').value.trim();
     const sys = `You are a training-data generator for an agent named "${a.name}" whose role is: ${a.prompt}\n\n${STRATEGY_INSTRUCTIONS[synthStrategy]}\n\nReturn ONLY a JSON array of ${synthCount} objects, each: {"title": "...", "text": "..."}. The text field should be 2-4 sentences. No prose outside the JSON array.`;
     const userMsg = `Examples to learn from:\n\n${seedTxt}\n\n${steering ? 'Steering: ' + steering + '\n\n' : ''}Now produce ${synthCount} new training documents as JSON.`;
@@ -663,9 +768,11 @@ toolGrid.addEventListener('click', e => {
   active().tools[which] = !active().tools[which];
   save(); renderTools();
 });
-$('exportAgent').addEventListener('click', () => {
+$('exportAgent').addEventListener('click', async () => {
   const a = active();
-  const blob = new Blob([JSON.stringify(a, null, 2)], { type: 'application/json' });
+  const chunks = await getChunks(a.id);
+  const bundle = { ...a, chunks };
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url; link.download = `${a.name}.json`;
@@ -689,7 +796,8 @@ async function generate(msg) {
   const a = active();
   if (a.mode === 'nvidia') {
     if (!state.keys.nvidia) throw new Error('no NVIDIA key — add one in Training');
-    const hits = retrieveChunks(a.chunks, msg, 6);
+    const allChunks = await getChunks(a.id);
+    const hits = retrieveChunks(allChunks, msg, 6);
     let context = '';
     if (hits.length) {
       let buf = '\n\nKnowledge (use ONLY this to answer; if the answer is not here, say so):\n';
@@ -720,10 +828,11 @@ async function generate(msg) {
     const raw = await sample(entry.model, seed, length, a.temperature, entry.vocab);
     return applyVoice(raw.trim(), a.voice);
   } else {
-    if (!a.chunks.length) throw new Error('no training data — add chunks first');
+    if (!a.chunkCount) throw new Error('no training data — add chunks first');
+    const localChunks = await getChunks(a.id);
 
     // 1. Retrieval first: if the user's message strongly matches a chunk, surface it directly.
-    const scored = retrieveScored(a.chunks, msg, 5);
+    const scored = retrieveScored(localChunks, msg, 5);
     if (scored.length) {
       const top = scored[0];
       const answer = extractAnswer(top.chunk.text);
@@ -739,11 +848,11 @@ async function generate(msg) {
 
     // 2. Focused Markov: train on the retrieved subset for relevance, fall back to the full corpus.
     const focus = scored.filter(x => x.score > 0).map(x => x.chunk);
-    const useChunks = focus.length >= 2 ? focus : a.chunks;
+    const useChunks = focus.length >= 2 ? focus : localChunks;
     let model = buildMarkov(useChunks, a.ngram);
     let raw = generateMarkov(model, msg, a.maxTokens, a.temperature);
-    if (!raw && useChunks !== a.chunks) {
-      model = buildMarkov(a.chunks, a.ngram);
+    if (!raw && useChunks !== localChunks) {
+      model = buildMarkov(localChunks, a.ngram);
       raw = generateMarkov(model, msg, a.maxTokens, a.temperature);
     }
     if (!raw) throw new Error('not enough data — add more chunks or lower the n-gram order');
@@ -774,4 +883,18 @@ playSend.addEventListener('click', sendMessage);
 playInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 
 /* ---------- Init ---------- */
-renderAll();
+(async () => {
+  // One-time migration: any chunks still living on the agent objects
+  // (from pre-IDB versions) move into IndexedDB. Idempotent.
+  try {
+    const moved = await moveLegacyChunksToDB(state, db.addChunksBatch);
+    if (moved) { save(); toast(`migrated chunks for ${moved} agent${moved > 1 ? 's' : ''} to IndexedDB`); }
+  } catch (err) {
+    console.error('migration failed', err);
+  }
+  // Refresh counts from IDB for every agent so the sidebar shows true totals.
+  for (const a of state.agents) {
+    try { await refreshCounts(a.id); } catch {}
+  }
+  await renderAll();
+})();
