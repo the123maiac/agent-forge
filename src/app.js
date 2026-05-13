@@ -1,6 +1,7 @@
 import { DATASETS } from './datasets.js';
 import { initialState, save as saveState, defaultAgent, moveLegacyChunksToDB } from './storage.js';
 import * as db from './db.js';
+import { BASE_CHUNKS, BASE_AGENT_ID, BASE_VERSION } from './baseCorpus.js';
 import { buildMarkov, generateMarkov, applyVoice } from './markov.js';
 import { retrieveChunks, retrieveScored, extractAnswer } from './retrieval.js';
 import { nvidiaChat, firecrawlScrape, firecrawlCrawl } from './api.js';
@@ -34,6 +35,33 @@ async function refreshCounts(agentId) {
   save();
 }
 
+/* Combined retrieval pool for an agent: own chunks + shared base when opted-in. */
+async function combinedChunks(a) {
+  const own = await getChunks(a.id);
+  if (!a.useBase) return own;
+  const base = await getChunks(BASE_AGENT_ID);
+  return [...base, ...own];
+}
+
+/* Install the shared base corpus once per BASE_VERSION. Idempotent. */
+async function ensureBaseCorpus() {
+  const flag = `forge.base.v${BASE_VERSION}`;
+  if (localStorage.getItem(flag)) return;
+  // Wipe any prior version, then load.
+  await db.deleteAllForAgent(BASE_AGENT_ID);
+  invalidateChunks(BASE_AGENT_ID);
+  const rows = BASE_CHUNKS.map(c => ({
+    id: crypto.randomUUID(),
+    agentId: BASE_AGENT_ID,
+    title: c.title,
+    text: c.text,
+    source: 'base-corpus',
+    ts: Date.now()
+  }));
+  await db.addChunksBatch(rows);
+  localStorage.setItem(flag, '1');
+}
+
 /* ---------- DOM refs ---------- */
 const $ = (id) => document.getElementById(id);
 const headMark = $('headMark'), headName = $('headName'), headDesc = $('headDesc');
@@ -57,6 +85,9 @@ const scrapeUrl = $('scrapeUrl'), scrapeBtn = $('scrapeBtn');
 const playShell = $('playShell'), playInput = $('playInput'), playSend = $('playSend'), playCrumbs = $('playCrumbs');
 const toolGrid = $('toolGrid');
 const toastEl = $('toast');
+
+const useBaseToggle = $('useBaseToggle');
+const baseInfo = $('baseInfo');
 
 const neuralPanel = $('neuralPanel');
 const epSlider = $('epSlider'), epVal = $('epVal');
@@ -148,6 +179,16 @@ function renderIdentity() {
   voicePills.querySelectorAll('.pill').forEach(p => p.classList.toggle('is-active', p.dataset.voice === a.voice));
   ngrams.querySelectorAll('.ngram').forEach(p => p.classList.toggle('is-active', +p.dataset.n === a.ngram));
   modeCards.querySelectorAll('.mode-card').forEach(p => p.classList.toggle('is-active', p.dataset.mode === a.mode));
+  useBaseToggle.setAttribute('aria-pressed', a.useBase ? 'true' : 'false');
+}
+
+async function renderBaseInfo() {
+  try {
+    const baseCount = await db.countForAgent(BASE_AGENT_ID);
+    baseInfo.textContent = `${baseCount.toLocaleString()} pre-baked chunks · loaded once · shared by all agents`;
+  } catch {
+    baseInfo.textContent = 'base corpus unavailable';
+  }
 }
 
 function renderDatasets() {
@@ -337,6 +378,7 @@ async function renderAll() {
   renderTools();
   renderKeys();
   renderPlayground();
+  await renderBaseInfo();
 }
 
 /* ---------- Knowledge helpers ---------- */
@@ -415,6 +457,12 @@ modeCards.addEventListener('click', e => {
   if (!btn) return;
   active().mode = btn.dataset.mode;
   save(); renderAll();
+});
+useBaseToggle.addEventListener('click', () => {
+  const a = active();
+  a.useBase = !a.useBase;
+  save(); renderAll();
+  toast(a.useBase ? 'using shared base corpus' : 'base corpus disabled for this agent');
 });
 iName.addEventListener('input', () => {
   active().name = iName.value.trim() || 'Untitled';
@@ -796,7 +844,7 @@ async function generate(msg) {
   const a = active();
   if (a.mode === 'nvidia') {
     if (!state.keys.nvidia) throw new Error('no NVIDIA key — add one in Training');
-    const allChunks = await getChunks(a.id);
+    const allChunks = await combinedChunks(a);
     const hits = retrieveChunks(allChunks, msg, 6);
     let context = '';
     if (hits.length) {
@@ -828,8 +876,8 @@ async function generate(msg) {
     const raw = await sample(entry.model, seed, length, a.temperature, entry.vocab);
     return applyVoice(raw.trim(), a.voice);
   } else {
-    if (!a.chunkCount) throw new Error('no training data — add chunks first');
-    const localChunks = await getChunks(a.id);
+    const localChunks = await combinedChunks(a);
+    if (!localChunks.length) throw new Error('no training data — add chunks first');
 
     // 1. Retrieval first: if the user's message strongly matches a chunk, surface it directly.
     const scored = retrieveScored(localChunks, msg, 5);
@@ -884,15 +932,17 @@ playInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(
 
 /* ---------- Init ---------- */
 (async () => {
-  // One-time migration: any chunks still living on the agent objects
-  // (from pre-IDB versions) move into IndexedDB. Idempotent.
   try {
     const moved = await moveLegacyChunksToDB(state, db.addChunksBatch);
     if (moved) { save(); toast(`migrated chunks for ${moved} agent${moved > 1 ? 's' : ''} to IndexedDB`); }
   } catch (err) {
     console.error('migration failed', err);
   }
-  // Refresh counts from IDB for every agent so the sidebar shows true totals.
+  try {
+    await ensureBaseCorpus();
+  } catch (err) {
+    console.error('base corpus install failed', err);
+  }
   for (const a of state.agents) {
     try { await refreshCounts(a.id); } catch {}
   }

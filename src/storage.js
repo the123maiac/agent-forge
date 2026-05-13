@@ -24,6 +24,8 @@ export function defaultAgent(name = 'Atlas') {
     // Counts are cached for cheap UI rendering; the actual chunks live in IDB.
     chunkCount: 0,
     chunkChars: 0,
+    // Every new agent piggybacks on the shared base corpus by default.
+    useBase: true,
     datasets: [],
     tools: { firecrawl: false, gworkspace: false, vector: false }
   };
@@ -53,6 +55,7 @@ export function migrate(s) {
         ? a.chunks.reduce((n, c) => n + (c.text || '').length, 0)
         : 0;
     }
+    if (a.useBase == null) a.useBase = true;
   }
   return s;
 }
