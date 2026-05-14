@@ -1,12 +1,12 @@
 {
-  "version": 1778721707859,
-  "epochs": 12,
-  "embedDim": 32,
-  "lstmUnits": 128,
-  "seqLen": 80,
-  "vocabSize": 100,
-  "finalLoss": 1.363033652305603,
-  "params": 98532,
-  "corpusChars": 37397,
-  "trainedAt": "2026-05-14T01:21:47.859Z"
+  "version": 1778774519041,
+  "epochs": 2,
+  "embedDim": 48,
+  "lstmUnits": 192,
+  "seqLen": 100,
+  "vocabSize": 198,
+  "finalLoss": 1.3958382606506348,
+  "params": 232806,
+  "corpusChars": 18878028,
+  "trainedAt": "2026-05-14T16:01:59.041Z"
 }
