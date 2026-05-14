@@ -8,7 +8,8 @@ import { nvidiaChat, firecrawlScrape, firecrawlCrawl } from './api.js';
 import {
   buildVocab, buildModel, trainModel, sample,
   saveModel, loadModel, deleteModel,
-  vocabToJSON, vocabFromJSON
+  vocabToJSON, vocabFromJSON,
+  loadBaseModel, getBaseModel, fineTuneFromBase
 } from './neural.js';
 
 /* ---------- State ---------- */
@@ -241,18 +242,21 @@ function renderTrainStatus() {
 function renderNeuralPanel() {
   const a = active();
   const cfg = a.neural || {};
-  epSlider.value = cfg.epochs || 20; epVal.textContent = epSlider.value; paintTrack(epSlider);
+  epSlider.value = cfg.epochs || 5; epVal.textContent = epSlider.value; paintTrack(epSlider);
   huSlider.value = cfg.lstmUnits || 96; huVal.textContent = huSlider.value; paintTrack(huSlider);
   slSlider.value = cfg.seqLen || 60; slVal.textContent = slSlider.value; paintTrack(slSlider);
   neuralStatus.className = 'neural-status';
+  const base = getBaseModel();
   if (a.neural?.trained) {
     neuralStatus.classList.add('is-ready');
-    neuralStatus.textContent = `trained · loss ${(+a.neural.finalLoss).toFixed(3)} · vocab ${a.neural.vocabSize}`;
-  } else if (a.chunkCount === 0) {
-    neuralStatus.classList.add('is-warn');
-    neuralStatus.textContent = 'load knowledge first';
+    const src = a.neural.fromBase ? 'fine-tuned from base' : 'trained locally';
+    neuralStatus.textContent = `${src} · loss ${(+a.neural.finalLoss).toFixed(3)} · ${a.neural.params.toLocaleString()} params`;
+  } else if (base) {
+    neuralStatus.classList.add('is-ready');
+    neuralStatus.textContent = `base model loaded · ${base.meta.params.toLocaleString()} params · loss ${(+base.meta.finalLoss).toFixed(3)} · shared across agents`;
   } else {
-    neuralStatus.textContent = 'no model · click train';
+    neuralStatus.classList.add('is-warn');
+    neuralStatus.textContent = 'base model not yet loaded';
   }
 }
 
@@ -640,54 +644,52 @@ trainBtn.addEventListener('click', async () => {
   const a = active();
   if (a.chunkCount === 0) { toast('add chunks first', true); return; }
   if (!window.tf) { toast('TensorFlow.js not loaded — check your connection', true); return; }
-  const epochs = +epSlider.value, lstmUnits = +huSlider.value, seqLen = +slSlider.value;
+  const base = getBaseModel() || await loadBaseModel().catch(() => null);
+  if (!base) { toast('base model not available — cannot fine-tune', true); return; }
+  const epochs = +epSlider.value, seqLen = +slSlider.value;
   trainBtn.disabled = true;
   resetNeuralBtn.disabled = true;
-  trainBtn.textContent = 'training…';
+  trainBtn.textContent = 'fine-tuning…';
   neuralProgress.classList.add('is-running');
   neuralConsole.replaceChildren();
   neuralConsole.hidden = false;
 
   try {
     const text = await corpusFor(a);
-    const vocab = buildVocab(text);
-    if (vocab.vocabSize > 200) {
-      // Very rare on natural text — char-level is bounded
-      toast(`large vocab (${vocab.vocabSize}) — training will be slow`);
-    }
-    const model = buildModel({ vocabSize: vocab.vocabSize, embedDim: 24, lstmUnits });
-    const params = model.countParams();
-    neuralProgress.textContent = `compiled · ${params} params · ${text.length} chars · ${vocab.vocabSize} symbols`;
+    neuralProgress.textContent = `fine-tuning from base · ${base.meta.params.toLocaleString()} params · ${text.length} chars`;
 
     let finalLoss = NaN;
-    await trainModel(model, text, vocab, { epochs, seqLen, batchSize: 32, stride: 3 }, async (epoch, loss) => {
+    await fineTuneFromBase(text, { epochs, seqLen, batchSize: 32, stride: 3 }, async (epoch, loss) => {
       finalLoss = loss;
       logEpoch(epoch, epochs, loss);
       neuralProgress.textContent = `epoch ${epoch}/${epochs} · loss ${loss.toFixed(3)}`;
     });
 
-    await saveModel(model, a.id);
-    neuralCache.set(a.id, { model, vocab });
+    await saveModel(base.model, a.id);
+    neuralCache.set(a.id, base);
     a.neural = {
       trained: true,
-      epochs, lstmUnits, seqLen,
-      vocabSize: vocab.vocabSize,
-      params,
+      epochs,
+      lstmUnits: base.meta.lstmUnits,
+      seqLen,
+      vocabSize: base.vocab.vocabSize,
+      params: base.meta.params,
       finalLoss,
-      vocabJSON: vocabToJSON(vocab),
-      trainedAt: Date.now()
+      vocabJSON: vocabToJSON(base.vocab),
+      trainedAt: Date.now(),
+      fromBase: true
     };
     save(); renderAll();
     neuralProgress.textContent = `done · loss ${finalLoss.toFixed(3)}`;
-    toast(`neural net trained · loss ${finalLoss.toFixed(3)}`);
+    toast(`fine-tuned from base · loss ${finalLoss.toFixed(3)}`);
   } catch (err) {
     console.error(err);
-    toast(err.message || 'training failed', true);
+    toast(err.message || 'fine-tuning failed', true);
     neuralProgress.textContent = 'failed';
   } finally {
     trainBtn.disabled = false;
     resetNeuralBtn.disabled = false;
-    trainBtn.textContent = '▶ train neural net';
+    trainBtn.textContent = '▶ fine-tune from base';
     neuralProgress.classList.remove('is-running');
   }
 });
@@ -869,8 +871,14 @@ async function generate(msg) {
     });
     return applyVoice(out, a.voice);
   } else if (a.mode === 'neural') {
-    const entry = await ensureNeural(a);
-    if (!entry) throw new Error('no trained model — click train in the Training tab');
+    // Prefer the per-agent fine-tuned model if it exists; otherwise use the
+    // shared base model that ships with the app.
+    let entry = await ensureNeural(a);
+    if (!entry) {
+      const base = getBaseModel() || await loadBaseModel().catch(() => null);
+      if (!base) throw new Error('base model not available — refresh the page or train one');
+      entry = base;
+    }
     const length = Math.min(220, Math.max(60, a.maxTokens * 3));
     const seed = msg.slice(-80);
     const raw = await sample(entry.model, seed, length, a.temperature, entry.vocab);
@@ -947,4 +955,10 @@ playInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(
     try { await refreshCounts(a.id); } catch {}
   }
   await renderAll();
+
+  // Kick off the shared neural base model load in the background.
+  // Re-renders so the neural panel shows the params/loss once it's in.
+  loadBaseModel().then(() => renderAll()).catch(err => {
+    console.warn('base neural model not available', err);
+  });
 })();

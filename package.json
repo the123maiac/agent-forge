@@ -1,0 +1,24 @@
+{
+  "name": "agent-forge",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/the123maiac/agent-forge.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/the123maiac/agent-forge/issues"
+  },
+  "homepage": "https://github.com/the123maiac/agent-forge#readme",
+  "devDependencies": {
+    "@tensorflow/tfjs-node": "^4.20.0"
+  }
+}

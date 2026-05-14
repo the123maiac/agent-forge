@@ -132,3 +132,71 @@ export function vocabFromJSON(json) {
     vocabSize: json.idxToChar.length
   };
 }
+
+/* Shipped base model: pretrained offline with scripts/train-base.js,
+   downloaded once and cached by the browser. Shared across every agent. */
+let baseModelCache = null;
+export async function loadBaseModel(baseUrl = './public/models/base') {
+  if (baseModelCache) return baseModelCache;
+  const tf = window.tf;
+  const candidates = [baseUrl, './models/base'];
+  let lastErr;
+  for (const root of candidates) {
+    try {
+      const [model, vocabJson, metaJson] = await Promise.all([
+        tf.loadLayersModel(`${root}/model.json`),
+        fetch(`${root}/vocab.json`).then(r => r.json()),
+        fetch(`${root}/meta.json`).then(r => r.json())
+      ]);
+      const vocab = vocabFromJSON(vocabJson);
+      baseModelCache = { model, vocab, meta: metaJson };
+      return baseModelCache;
+    } catch (err) { lastErr = err; }
+  }
+  throw lastErr || new Error('base model not found');
+}
+
+export function getBaseModel() { return baseModelCache; }
+
+/* Fine-tune the base model on per-agent text. Re-compiles to make the
+   weights trainable in the browser session, runs continued training on
+   the user's corpus. The base weights are the starting point, so even a
+   couple of epochs nudges the model toward the user's domain. */
+export async function fineTuneFromBase(text, { epochs = 5, seqLen = 60, batchSize = 32, stride = 3 }, onEpochEnd) {
+  const tf = window.tf;
+  if (!baseModelCache) throw new Error('base model not loaded');
+  const { model, vocab } = baseModelCache;
+  // Re-compile so subsequent .fit() actually runs.
+  model.compile({ optimizer: tf.train.adam(0.001), loss: 'categoricalCrossentropy' });
+  if (text.length < seqLen + 2) throw new Error('not enough text — add more chunks');
+
+  const unk = vocab.charToIdx.get('<UNK>');
+  const encoded = new Array(text.length);
+  for (let i = 0; i < text.length; i++) encoded[i] = vocab.charToIdx.get(text[i]) ?? unk;
+
+  const Xs = [], Ys = [];
+  for (let i = 0; i + seqLen + 1 <= encoded.length; i += stride) {
+    Xs.push(encoded.slice(i, i + seqLen));
+    Ys.push(encoded.slice(i + 1, i + seqLen + 1));
+  }
+  if (!Xs.length) throw new Error('corpus too small for chosen sequence length');
+
+  const xs = tf.tensor2d(Xs, [Xs.length, seqLen], 'int32');
+  const ysIdx = tf.tensor2d(Ys, [Ys.length, seqLen], 'int32');
+  const ys = tf.tidy(() => tf.oneHot(ysIdx, vocab.vocabSize));
+  ysIdx.dispose();
+  try {
+    await model.fit(xs, ys, {
+      epochs, batchSize, shuffle: true,
+      callbacks: {
+        onEpochEnd: async (epoch, logs) => {
+          await onEpochEnd?.(epoch + 1, logs.loss);
+          await tf.nextFrame();
+        }
+      }
+    });
+  } finally {
+    xs.dispose(); ys.dispose();
+  }
+  return { examples: Xs.length };
+}
